@@ -1,0 +1,36 @@
+data:
+  type: scannet
+  data_root: ./data/scannet/aligned_scans
+  config_root: ./datasets/configs/scannet
+  output_folder: tiger_output
+  # rgbd dataset related
+  start: 0
+  end: -1
+  stride: 5
+  desired_height: 480
+  desired_width: 640
+
+detector:
+  type: cropformer
+  config_file: ./3rdparty/Entity/Entityv2/CropFormer/configs/entityv2/entity_segmentation/mask2former_hornet_3x.yaml
+  vocabulary: none
+  confidence_thresh: 0.5
+  save_vis: True
+
+extractor:
+  type: ovseg_tap
+  config_file: ./3rdparty/ovseg/configs/ovseg_swinB_vitL_demo.yaml
+  feat_dim: 768
+  voc_feature: ./tiger/evaluation/voc_features/scannet20_clip_l_14_vild.npy
+  back_feat: ovseg
+
+merge:
+  scale_f: 0.7
+  depth_thresh: 0.1
+  size_thresh: 25
+  interval: 100
+  visibility_thresh: 0.1
+  ground_indices: None
+
+eval:
+  feature_name: back_prj_feat_mean

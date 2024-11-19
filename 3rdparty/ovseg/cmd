@@ -1,0 +1,1 @@
+python demo.py --config-file configs/ovseg_swinB_vitL_demo.yaml --class-names 'table' 'guitar' 'bag'  --input ./resources/demo_samples/sample_03.jpeg --output ./pred --opts MODEL.WEIGHTS ovseg_swinbase_vitL14_ft_mpt.pth
