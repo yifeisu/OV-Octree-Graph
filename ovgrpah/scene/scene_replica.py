@@ -1,28 +1,39 @@
-import warnings
-
-import numpy as np
-
-warnings.warn("deprecated", DeprecationWarning)
-
-# Ignore warnings in obj loader
 import open3d as o3d
+from typing import List, Union
 
-o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
-
-import sys
-
+import copy
+import importlib
 import json
+import operator
+import os
+import pickle
+import sys
+import plyfile
+from collections import deque, Counter, defaultdict
+from functools import reduce
+from time import perf_counter
+
+import cv2
+import networkx as nx
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
 from PIL import Image
 
-from torchmetrics.functional import pairwise_cosine_similarity
+from numba import njit
+from scipy.optimize import linear_sum_assignment
+from sklearn.cluster import DBSCAN
+from sklearn.neighbors import BallTree
 
+from torchmetrics.functional import pairwise_cosine_similarity
 from tqdm import tqdm
-import networkx as nx
 import pycocotools.mask as mask_util
 
 # ----------------------------------------------------------------------------------------- #
 # our lib
 # ----------------------------------------------------------------------------------------- #
+from datasets.constants.replica.replica_constants import REPLICA_CLASSES, REPLICA_CLASSES_VALIDATION, REPLICA_COLOR_MAP_101
 # lib
 from .building import build_detector, build_extractor
 from ..stream.datasets_common import get_dataset
@@ -33,7 +44,8 @@ from ..utils.metric import *
 from ..utils.merging import *
 from ..structure.scene_graph import *
 
-IGNORE_INDEX = -1
+IGNORE_INDEX = 0
+
 
 def masks_to_rle(instances: Instances):
     """
@@ -53,6 +65,77 @@ def rle_to_masks(instances: Instances):
     return instances
 
 
+def read_ply_and_assign_colors_replica(file_path, semantic_info_path):
+    """
+    Read PLY file and assign colors based on object_id for replica dataset
+    :param file_path: path to PLY file
+    :param semantic_info_path: path to semantic info JSON file
+    :return: point cloud, class ids, point cloud instance, object ids
+    """
+    # Read PLY file
+    plydata = plyfile.PlyData.read(file_path)
+
+    # Read semantic info
+    with open(semantic_info_path) as f:
+        semantic_info = json.load(f)
+    object_class_mapping = {obj["id"]: obj["class_id"] for obj in semantic_info["objects"]}
+    # all instance with annotated class in the current scene
+    unique_class_ids = np.unique(list(object_class_mapping.values()))
+
+    # extract vertex data
+    vertices = np.vstack([plydata["vertex"]["x"], plydata["vertex"]["y"], plydata["vertex"]["z"]]).T
+    # extract object_id and normalize it to use as color
+    face_vertices = plydata["face"]["vertex_indices"]
+    object_ids = plydata["face"]["object_id"]
+
+    # 1. instance point cloud; not all annotated;
+    object_ids1 = np.zeros(vertices.shape[0], dtype=np.int32)
+    for i, face in enumerate(face_vertices):
+        object_ids1[face] = object_ids[i]
+
+    # 2. semantic point cloud;
+    class_ids = np.zeros(vertices.shape[0], dtype=np.int32)
+    for i, face in enumerate(face_vertices):
+        class_ids[face] = object_class_mapping[object_ids[i]] if object_ids[i] in object_class_mapping else 0
+
+    # 1. instance colors
+    unique_object_ids = np.unique(object_ids)
+    instance_colors = np.zeros((len(object_ids1), 3))
+    unique_colors = np.random.rand(len(unique_object_ids), 3)
+    for i, object_id in enumerate(unique_object_ids):
+        instance_colors[object_ids1 == object_id] = unique_colors[i]
+
+    # 2. semantic colors
+    class_colors = np.zeros((len(object_ids1), 3))
+    unique_class_colors = np.random.rand(len(unique_class_ids), 3)
+    for i, class_id in enumerate(unique_class_ids):
+        class_colors[class_ids == class_id] = unique_class_colors[i]
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(vertices)
+    pcd.colors = o3d.utility.Vector3dVector(class_colors)
+
+    pcd_instance = o3d.geometry.PointCloud()
+    pcd_instance.points = o3d.utility.Vector3dVector(vertices)
+    pcd_instance.colors = o3d.utility.Vector3dVector(instance_colors)
+
+    return class_ids, object_ids1, pcd, pcd_instance
+
+
+def read_semantic_classes_replica(semantic_info_path, crete_color_map=False):
+    """
+    Read semantic classes for replica dataset
+    :param semantic_info_path: path to semantic info JSON file
+    :param crete_color_map: whether to create color map
+    :return: class id names
+    """
+    with open(semantic_info_path) as f:
+        semantic_info = json.load(f)
+    class_id_names = {0: "other"}
+    class_id_names.update({obj["id"]: obj["name"] for obj in semantic_info["classes"]})
+    return class_id_names
+
+
 def build_scene_graph2(scene_pcd, anchor_objects, vocabs=None, vocab_features=None):
     N = len(anchor_objects)
     scene_pcd = copy.deepcopy(scene_pcd)
@@ -69,7 +152,6 @@ def build_scene_graph2(scene_pcd, anchor_objects, vocabs=None, vocab_features=No
         G.nodes[i]['feature'] = anchor_objects[i].mask_feature.cpu().numpy()
         G.nodes[i]['detections'] = (anchor_objects[i].image_idx, anchor_objects[i].image_path, torch.sum(anchor_objects[i].mask_ids))
         G.nodes[i]['contained'] = anchor_objects[i].contained
-        G.nodes[i]['containing'] = anchor_objects[i].containing
         G.nodes[i]['mask_center'] = anchor_objects[i].mask_center
         G.nodes[i]['merge_num'] = anchor_objects[i].merge_num
         if vocabs is not None and vocab_features is not None:
@@ -88,7 +170,7 @@ def make_colors():
     return colors
 
 
-class ScanNetSceneGraph:
+class ReplicaSceneGraph:
     def __init__(
             self,
             cfg,
@@ -100,7 +182,7 @@ class ScanNetSceneGraph:
     ):
         self.extractor = None
         self.detector = None
-
+        self.extracter = None
         self.cfg = cfg
         self.scene_id = scene_id
         self.process_idx = process_idx
@@ -110,7 +192,7 @@ class ScanNetSceneGraph:
         # ----------------------------------------------------------------------------------------- #
         # obtain the scene data property, rgbd stream, point-cloud, and gt semantic.
         # ----------------------------------------------------------------------------------------- #
-        scene_config_path = os.path.join(cfg.data.config_root, f"{scene_id}.yaml")
+        scene_config_path = os.path.join(cfg.data.config_root, "replica.yaml")
         # 0. build the rgbd stream dataset
         self.rgbd = get_dataset(
             dataconfig=scene_config_path,
@@ -125,55 +207,27 @@ class ScanNetSceneGraph:
             dtype=torch.float,
         )
 
-        # 1. read the gt ply
-        gt_ply_path = os.path.join(cfg.data.data_root, scene_id, f"{scene_id}_vh_clean_2.ply")
+        # 1. read the gt ply, each point's class, and color map;
+        # gt ply
+        gt_ply_path = os.path.join(cfg.data.data_root, scene_id, f"{scene_id}_mesh.ply")
         self.gt_point = o3d.io.read_point_cloud(str(gt_ply_path))
         self.gt_xyz = np.asarray(self.gt_point.points)
 
-        # 2. read the gt semantic
-        gt_segs_path = os.path.join(cfg.data.data_root, scene_id, f"{scene_id}_vh_clean_2.0.010000.segs.json")
-        gt_aggr_path = os.path.join(cfg.data.data_root, scene_id, f"{scene_id}.aggregation.json")
-        # 2.1 load segments file, over-segmentation id
-        with open(gt_segs_path) as f:
-            segments = json.load(f)
-            seg_indices = np.array(segments["segIndices"])
-        # 2.2 load aggregations file, instance with cat_id
-        with open(gt_aggr_path) as f:
-            aggregation = json.load(f)
-            seg_groups = np.array(aggregation["segGroups"])
-        labels_pd = pd.read_csv("datasets/constants/scannet/scannetv2-labels.combined.tsv", sep="\t", header=0)
-        self.semantic_gt_200, self.semantic_gt_20, self.gt_cat_ids, self.gt_masks = self.get_gt_semantic(seg_groups, seg_indices, labels_pd)
+        # scene class name and id
+        semantic_info_path = os.path.join(cfg.data.data_root, self.scene_id, "habitat", "info_semantic.json")
+        # classes occur in all replica scenes
+        self.class_id_name = read_semantic_classes_replica(semantic_info_path, crete_color_map=True)
+        replica_labels_101 = list(self.class_id_name.values())
+        assert REPLICA_CLASSES == replica_labels_101
+
+        # read ply
+        ply_path = os.path.join(cfg.data.data_root, self.scene_id, "habitat", "mesh_semantic.ply")
+        self.semantic_gt, self.instance_gt, gt_pcd_semantic_vis, gt_pcd_instance_vis = read_ply_and_assign_colors_replica(ply_path, semantic_info_path)
 
         # ----------------------------------------------------------------------------------------- #
         # define and create some scene path
         # ----------------------------------------------------------------------------------------- #
         self.output_folder, self.output_proposal_folder, self.output_vis_folder, self.output_instance_folder, self.output_predict_folder, self.output_result_folder, self.out_file_prefix = parse_scene_path(cfg, scene_id)
-
-    def get_gt_semantic(self, seg_groups, seg_indices, labels_pd, ignore_index=(0,)):
-        # parse each instance
-        gt_cat_ids, gt_masks = [], []
-        semantic_gt200 = np.ones((self.gt_xyz.shape[0]), dtype=np.int16) * IGNORE_INDEX
-        semantic_gt20 = np.ones((self.gt_xyz.shape[0]), dtype=np.int16) * IGNORE_INDEX
-        for group in seg_groups:
-            point_idx, label_id20, label_id200 = point_indices_from_group(seg_indices, group, labels_pd)
-            semantic_gt200[point_idx] = label_id200
-            semantic_gt20[point_idx] = label_id20
-
-            # filter out the ignore class
-            if label_id200 not in ignore_index and label_id200 != IGNORE_INDEX:
-                gt_cat_ids.append(label_id200)
-                gt_masks.append(point_idx)
-
-        # each point's cai_id, [Np, ], the index is already in scannet200 set
-        semantic_gt200 = semantic_gt200.astype(int)
-        semantic_gt20 = semantic_gt20.astype(int)
-
-        # each instance's id, [Ni, ]
-        gt_cat_ids = np.array(gt_cat_ids)
-        # each instance idx in point_clouds, [Ni, Np]
-        gt_masks = np.array(gt_masks)
-
-        return semantic_gt200, semantic_gt20, gt_cat_ids, gt_masks
 
     def build_detector(self):
         return build_detector(self.cfg, self.model_device)
@@ -191,8 +245,8 @@ class ScanNetSceneGraph:
         # 2. for each rgb image, generate the 2d proposals
         for idx in tqdm(range(len(self.rgbd)), position=self.process_idx, desc=f"{self.scene_id}-{self.process_idx}", ncols=160):
             frame_id = os.path.basename(self.rgbd.color_paths[idx]).split('.')[0]
-
             _color = self.rgbd.get_rgb(idx)
+
             # run inference
             instances = self.detector(_color)
 
@@ -211,9 +265,9 @@ class ScanNetSceneGraph:
                 output_path = os.path.join(self.output_vis_folder, f"{frame_id}.jpg")
                 cv2.imwrite(output_path, cv2.cvtColor(vis_im, cv2.COLOR_RGB2BGR))
 
-            # save instance
-            masks_to_rle(instances)
-            instances.remove('pred_masks')
+                # save instance
+                masks_to_rle(instances)
+                instances.remove('pred_masks')
 
             output_path = os.path.join(self.output_proposal_folder, f"{frame_id}.pkl")
             with open(output_path, 'wb') as f:
@@ -280,14 +334,6 @@ class ScanNetSceneGraph:
             pred_features = F.normalize(pred_features, dim=1, p=2)
 
             # filter segment on the edge
-            valid_mask = []
-            template_image = self.get_edge_template(pred_masks.shape[2], pred_masks.shape[1], 20)
-            for ii, pred_mask in enumerate(pred_masks):
-                if np.sum(template_image * pred_mask) / np.sum(pred_mask) >= 0.75:
-                    continue
-                valid_mask.append(ii)
-            valid_mask = np.array(valid_mask)
-            pred_scores, pred_masks, pred_features = pred_scores[valid_mask], pred_masks[valid_mask], pred_features[valid_mask]
             template_image = self.get_edge_template(pred_masks.shape[2], pred_masks.shape[1], 10)
             pred_mask_center = np.zeros_like(pred_scores, dtype=np.int32)
             for ii, pred_mask in enumerate(pred_masks):
@@ -296,7 +342,6 @@ class ScanNetSceneGraph:
 
             # backproject the scene gt point
             _, depth_im, cam_intr, pose = self.rgbd[idx]
-
             cam_intr = cam_intr[:3, :3]
             pcd = copy.deepcopy(self.gt_point).transform(np.linalg.inv(pose))
             scene_pts = np.asarray(pcd.points)
@@ -313,12 +358,6 @@ class ScanNetSceneGraph:
             if masked_pts.shape[0] <= 0:
                 continue
 
-            # * preprocess each segment * #
-            # 1. dbscan denoise
-            masked_pts = masked_pts.long()
-            filter_pt_by_dbscan_noise(copy.deepcopy(self.gt_xyz), masked_pts)
-            masked_pts = masked_pts.bool()
-
             # * regester all detected segments * #
             detect_segments = InstanceList()
             for ii in range(masked_pts.shape[0]):
@@ -332,13 +371,13 @@ class ScanNetSceneGraph:
                 )
                 detect_segments.append(segment)
 
-            # * light merging * #
+            # * light merging, reduce duplicated mask * #
             if len(anchor_objects) == 0:
                 anchor_objects.extend(detect_segments)
             else:
                 iou_matrix, precision_matrix, recall_matrix = compute_relation_matrix2(detect_segments, anchor_objects, visibility_mask)  # [K, M]
                 semantic_similarity_matrix = pairwise_cosine_similarity(detect_segments.get_stacked_values_torch('mask_feature'), anchor_objects.get_stacked_values_torch('mask_feature'))  # [1, N]
-                adjacency_matrix = (iou_matrix >= 0.4) & (semantic_similarity_matrix >= 0.8)
+                adjacency_matrix = (iou_matrix >= 0.5) & (semantic_similarity_matrix >= 0.8)
                 to_move = []
                 for ii in range(adjacency_matrix.shape[0]):
                     if torch.sum(adjacency_matrix[ii]) > 0:
@@ -352,11 +391,13 @@ class ScanNetSceneGraph:
             # sub-graph merging
             if (idx == (len(self.rgbd) - 1)) or ((idx % interval == 0) and idx != 0):
                 # ===================== filter instances based on visibility and size =====================#
-                anchor_objects = filter_pt_by_dbscan_noise2(copy.deepcopy(self.gt_xyz), anchor_objects)
-                anchor_objects = filter_pt_by_visibility_count2(anchor_objects, visibility_count, 0.1)
+                anchor_objects = filter_pt_by_dbscan_noise2(copy.deepcopy(self.gt_xyz), anchor_objects, 0.1, 10)
+                anchor_objects = filter_pt_by_visibility_count2(anchor_objects, visibility_count, 0.05)
                 anchor_objects = filter_by_instance_size_no_media2(anchor_objects, size_thresh=self.cfg.merge.size_thresh, median=True)
 
-                # ===================== undersegment filtering =====================#
+                # -------------------------------------------------------------------------------------- #
+                # undersegment filtering
+                # -------------------------------------------------------------------------------------- #
                 iou_matrix, precision_matrix, recall_matrix = compute_relation_matrix_self2(anchor_objects)
                 semantic_similarity_matrix = pairwise_cosine_similarity(anchor_objects.get_stacked_values_torch('mask_feature'), anchor_objects.get_stacked_values_torch('mask_feature'))
                 precision_matrix_bool = precision_matrix >= 0.8  # find the segments contained in each instance
@@ -365,13 +406,13 @@ class ScanNetSceneGraph:
                     if torch.sum(precision_matrix_bool[ii]) > 2:  # containing at least one segment;
                         precision_matrix_bool[ii][ii] = 0.0
                         contained_segment_ii = torch.where(precision_matrix_bool[ii])[0]
-                        if torch.sum(semantic_similarity_matrix[ii][contained_segment_ii] <= 0.9) / contained_segment_ii.shape[0] > 0.6 and anchor_objects[ii].merge_num <= 10:
+                        if torch.sum(semantic_similarity_matrix[ii][contained_segment_ii] <= 0.9) / contained_segment_ii.shape[0] > 0.75 and anchor_objects[ii].merge_num <= 10:
                             to_delete.append(ii)
                         precision_matrix_bool[ii][ii] = 1.0
                 anchor_objects = anchor_objects.delete_index(to_delete)
 
                 # -------------------------------------------------------------------------------------- #
-                # liner decay & decouple
+                # dynamic threshold
                 # -------------------------------------------------------------------------------------- #
                 final_segments = InstanceList()
                 to_move = []
@@ -422,7 +463,6 @@ class ScanNetSceneGraph:
                     if stop and ii >= 5:
                         break
 
-                    final_segments = filter_pt_by_dbscan_noise2(copy.deepcopy(self.gt_xyz), final_segments)
                     final_segments = filter_by_instance_size_no_media2(final_segments, size_thresh=self.cfg.merge.size_thresh, median=True)
 
                 ii = 0
@@ -461,7 +501,6 @@ class ScanNetSceneGraph:
                     if stop and ii >= 10:
                         break
 
-                    anchor_objects = filter_pt_by_dbscan_noise2(copy.deepcopy(self.gt_xyz), anchor_objects)
                     anchor_objects = filter_by_instance_size_no_media2(anchor_objects, size_thresh=self.cfg.merge.size_thresh, median=True)
 
                 anchor_objects.extend(final_segments)
@@ -471,9 +510,6 @@ class ScanNetSceneGraph:
                     stop = True
                     iou_matrix, precision_matrix, recall_matrix = compute_relation_matrix_self2(anchor_objects)
                     semantic_similarity_matrix = pairwise_cosine_similarity(anchor_objects.get_stacked_values_torch('mask_feature'), anchor_objects.get_stacked_values_torch('mask_feature'))
-
-                    iou_matrix = iou_matrix * (semantic_similarity_matrix + 0.1)
-                    recall_matrix = recall_matrix * (semantic_similarity_matrix + 0.1)
 
                     recall_matrix_bool, iou_matrix_bool, semantic_similarity_matrix_bool = recall_matrix >= max(recall_t, 0.5), iou_matrix >= max(iou_t, 0.15), semantic_similarity_matrix >= max(similarity_t, 0.8)
                     adjacency_matrix = (recall_matrix_bool | iou_matrix_bool) & semantic_similarity_matrix_bool
@@ -502,15 +538,12 @@ class ScanNetSceneGraph:
                     if stop and ii >= 5:
                         break
 
-                    anchor_objects = filter_pt_by_dbscan_noise2(copy.deepcopy(self.gt_xyz), anchor_objects)
                     anchor_objects = filter_by_instance_size_no_media2(anchor_objects, size_thresh=self.cfg.merge.size_thresh, median=True)
 
         # -------------------------------------------------------------------------------------- #
         # -1. post-processing
         # -------------------------------------------------------------------------------------- #
-        anchor_objects = filter_pt_by_dbscan_noise2(copy.deepcopy(self.gt_xyz), anchor_objects)
-        anchor_objects = post_processing2(copy.deepcopy(self.gt_point), anchor_objects)
-
+        anchor_objects = filter_pt_by_visibility_count2(anchor_objects, visibility_count, 0.1)
         scene_graph = build_scene_graph2(self.gt_point, anchor_objects, vocabs=None, vocab_features=None)
         output_file = f"proposed_fusion_{self.out_file_prefix}_interval-{self.cfg.merge.interval}.pkl"
         graph_output_folder = os.path.join(self.output_predict_folder, output_file)
@@ -563,6 +596,7 @@ class ScanNetSceneGraph:
                 cam_intr = cam_intr[:3, :3]
                 projected_pts = compute_projected_pts(segment_pts, cam_intr)  # (n, 2)
                 visibility_mask = compute_visibility_mask(segment_pts, projected_pts, depth_im, depth_thresh=self.cfg.merge.depth_thresh)  # [n,]
+
                 if np.sum(visibility_mask) <= 0:
                     continue
 
@@ -589,8 +623,8 @@ class ScanNetSceneGraph:
             # * cut the min 20% off * #
             corres_scan_area = np.array(corres_obj_area)
             corres_scan_area_idx = np.argsort(corres_scan_area)[::-1]
-            cut_idx = max(int(0.9 * len(corres_scan_area_idx)), 1)  # max(int(0.9 * len(corres_scan_area_idx)), 1)
-            corres_scan_area_idx = corres_scan_area_idx[:cut_idx]
+            cut_idx = max(int(0.1 * len(corres_scan_area_idx)), 1)  # max(int(0.9 * len(corres_scan_area_idx)), 1)
+            corres_scan_area_idx = corres_scan_area_idx[:]
 
             # node property
             scene_graph.nodes[node]["back_prj_feat_list"] = []
@@ -680,82 +714,26 @@ class ScanNetSceneGraph:
         # * save the processed secen graph * #
         output_file = f"proposed_fusion_{self.out_file_prefix}_{self.cfg.extractor.back_feat}_interval-{self.cfg.merge.interval}-backprj.pkl"
         scene_graph_path = os.path.join(self.output_predict_folder, output_file)
-
         with open(scene_graph_path, 'wb') as fp:
             pickle.dump(scene_graph, fp)
             print(f"Saved to {scene_graph_path}")
 
-    def evaluate_retrieval(self):
-        # ----------------------------------------------------------------------------------------- #
-        # process the scannet 200, classes
-        # ----------------------------------------------------------------------------------------- #
-        id_mapping_path = f"datasets/constants/scannet/scannetv2-labels.combined.tsv"
-        df = pd.read_csv(id_mapping_path, sep="\t")
-        id_mapping = {cat_id: i for i, cat_id in enumerate(VALID_CLASS_IDS_200)}
-
-        CLASS_LABELS = CLASS_LABELS_200
-        VALID_CLASS_IDS = VALID_CLASS_IDS_200
-        ID_TO_LABEL = {}
-        LABEL_TO_ID = {}
-        for i in range(len(VALID_CLASS_IDS)):
-            LABEL_TO_ID[CLASS_LABELS[i]] = VALID_CLASS_IDS[i]
-            ID_TO_LABEL[VALID_CLASS_IDS[i]] = CLASS_LABELS[i]
-
-        # uncountable categories: i.e. "wall", "floor" and their subcategories + "ceiling"
-        INVALID_IDS = [df['id'][i] for i in range(df.shape[0]) if df['nyuClass'][i] in ("wall", "floor") or df['nyuClass'][i] == "ceiling"]
-        VAL_IDS = set(i for i in CLASS_LABELS_200_VALIDATION if i not in INVALID_IDS)
-
-        # ----------------------------------------------------------------------------------------- #
-        # class feature
-        # ----------------------------------------------------------------------------------------- #
-        vocab_features = np.load(f"{self.cfg.model.voc_feature}")
-        cat_id_to_feature = {cat_id: vocab_features[id_mapping[cat_id]] for cat_id in VALID_CLASS_IDS}
-
-        print(f"{len(CLASS_LABELS_200_VALIDATION) = }")
-        print(f"After filtering uncountable categories, {len(VAL_IDS) = }")
-
-        scene_pcd = copy.deepcopy(self.gt_point)
-
-        output_file = f"proposed_fusion_{self.cfg.model.type}_interval-{self.cfg.merge.interval}.pkl"
-        scene_graph_path = os.path.join(self.output_predict_folder, output_file)
-
-        if not os.path.isfile(scene_graph_path):
-            print("========================================")
-            print(f"{scene_graph_path = } doesn't exist!")
-            print("========================================")
-            return
-
-        with open(scene_graph_path, 'rb') as fp:
-            scene_graph = pickle.load(fp)
-            scene_graph.graph['scan'] = self.scene_id
-            scene_graph.graph['n_pts'] = len(scene_pcd.points)
-
-        gt_path = f"datasets/constants/scannet/scannet200_instance_gt/validation/{self.scene_id}.txt"
-        gt_instance_ids = np.loadtxt(gt_path, dtype=np.int64)
-        gt_cat_ids, gt_masks = get_gt_instances(gt_instance_ids, valid_ids=VAL_IDS)
-        pred_features, pred_masks, pred_caption_features, _, _ = get_predicted_instances(scene_graph, self.cfg.eval.feature_name)
-
-        output_file = f"proposed_fusion_{self.cfg.model.type}_interval-{self.cfg.merge.interval}-{self.cfg.eval.feature_name}-retrieval.pkl"
-        output_path = os.path.join(self.output_result_folder, output_file)
-        #
-        ap_results = compute_ap_for_each_scan(pred_features, pred_caption_features, pred_masks, gt_cat_ids, gt_masks, cat_id_to_feature, self.cfg.merge.scale_f)
-        with open(output_path, 'wb') as fp:
-            pickle.dump(ap_results, fp)
-        print(f"Processed {self.scene_id = }. Results saved to: {output_path}")
-
-    def evaluate_segmentation_20_opt(self):
+    def evaluate_segmentation_opt(self):
         # ----------------------------------------------------------------------------------------- #
         # load the feature of the class name, scannet 200 or replica
         # ----------------------------------------------------------------------------------------- #
-        # uncountable categories: i.e. "wall", "floor" and their subcategories + "ceiling"
-        ignore = [-1]
-        for _id, name in enumerate(CLASS_LABELS_20):
-            if "wall" in name or "floor" in name or "ceiling" in name or "door" in name or "window" in name:
-                ignore.append(_id)
-
-        # class feature for scannet 200
+        # class feature for replica 101+1
         v_vocab_features = np.load(f"{self.cfg.extractor.voc_feature}")
-        t_vocab_features = np.load(f"./tiger/evaluation/voc_features/scannet20_clip_l_14_vild.npy")
+        t_vocab_features = np.load(f"./ovgraph/evaluation/voc_features/replica101_clip_l_14_vild.npy")
+
+        # -------------------------------------------------------------------------------------- #
+        # evaluation setting of hovsg;
+        # -------------------------------------------------------------------------------------- #
+        # uncountable categories: i.e. "wall", "floor" and their subcategories + "ceiling"
+        ignore = [-1, 0]
+        for _id, name in self.class_id_name.items():
+            if "wall" in name or "floor" in name or "ceiling" in name or "door" in name or "window" in name or "other" in name:
+                ignore.append(_id)
 
         # ----------------------------------------------------------------------------------------- #
         # prepare the predction results, preds (N,)
@@ -773,44 +751,52 @@ class ScanNetSceneGraph:
             scene_graph.graph['scan'] = self.scene_id
             scene_graph.graph['n_pts'] = len(self.gt_xyz)
 
+        # get the feature list; each node owns multiple view feature and caption;
         pred_features, pred_masks, pred_caption_features, pred_features_list, pred_caption_features_list = get_predicted_instances(scene_graph, feature_name=self.cfg.eval.feature_name)
-
-        # 2. representive and difference
+        # representive and difference
         pred_features = rep_dif_denoise(pred_features_list)
         # pred_caption_features = rep_dif_denoise(pred_caption_features_list)
 
         # compute the class logits
         pred_class_sim1 = pred_features @ v_vocab_features.T  # (num_objects, num_classes)
         pred_class_sim2 = pred_caption_features @ t_vocab_features.T  # (num_objects, num_classes)
-        # scale
-        pred_class = (torch.softmax(torch.from_numpy(pred_class_sim1), dim=-1) * self.cfg.merge.scale_f + torch.softmax(torch.from_numpy(pred_class_sim2), dim=-1) * (1 - self.cfg.merge.scale_f)).argmax(-1)  # (num_objects,)
 
-        #
-        predction_20 = np.ones((self.gt_xyz.shape[0]), dtype=np.int16) * IGNORE_INDEX
+        # -------------------------------------------------------------------------------------- #
+        # whether use only the gt class for segmentation
+        # -------------------------------------------------------------------------------------- #
+        # gt_uni_cls = np.ones([102], dtype=np.uint8)
+        ignore_idx = np.ones([102], dtype=np.uint8)
+        gt_uni_cls = np.unique(self.semantic_gt)
+        ignore_idx[gt_uni_cls] = 0
+        ignore_idx = torch.from_numpy(ignore_idx).bool()
+        # pred_class_sim1[:, ignore_idx] = 0.0
+        # pred_class_sim2[:, ignore_idx] = 0.0
+        keep_index = np.setdiff1d(gt_uni_cls, ignore)
+
+        # way 1
+        pred_class = (torch.softmax(torch.from_numpy(pred_class_sim1), dim=-1) * self.cfg.merge.scale_f + torch.softmax(torch.from_numpy(pred_class_sim2), dim=-1) * (1 - self.cfg.merge.scale_f)).argmax(-1)  # (num_objects,)
+        # predicted labels
+        predction_101 = np.ones((self.gt_xyz.shape[0]), dtype=np.int16) * IGNORE_INDEX
         for i in range(len(pred_class)):
-            predction_20[pred_masks[i]] = pred_class[i]
+            predction_101[pred_masks[i]] = pred_class[i]
 
         # * simple visualize * #
-        class2color = np.array([value for key, value in SCANNET_COLOR_MAP_20.items()]) / 255.0
+        class2color = np.array([value for key, value in REPLICA_COLOR_MAP_101.items()]) / 255.0
         pred_pcd = o3d.geometry.PointCloud()
         pred_pcd.points = o3d.utility.Vector3dVector(self.gt_xyz)
         # gt
-        semantic_gt_20 = copy.deepcopy(self.semantic_gt_20)
-        semantic_gt_20[semantic_gt_20 == IGNORE_INDEX] = 20
-        pred_pcd.colors = o3d.utility.Vector3dVector(class2color[semantic_gt_20])
-        output_file = f"proposed_fusion_{self.out_file_prefix}_interval-{self.cfg.merge.interval}-{self.cfg.eval.feature_name}-visualize-gt.ply"
+        pred_pcd.colors = o3d.utility.Vector3dVector(class2color[self.semantic_gt])
+        output_file = f"proposed_fusion_{self.out_file_prefix}_interval-{self.cfg.merge.interval}-visualize-gt.ply"
         output_path = os.path.join(self.output_result_folder, output_file)
         o3d.io.write_point_cloud(output_path, pred_pcd)
         # pred
-        predction_20_visaul = copy.deepcopy(predction_20)
-        predction_20_visaul[predction_20_visaul == IGNORE_INDEX] = 20
-        pred_pcd.colors = o3d.utility.Vector3dVector(class2color[predction_20_visaul])
-        output_file = f"proposed_fusion_{self.out_file_prefix}_interval-{self.cfg.merge.interval}-{self.cfg.eval.feature_name}-visualize.ply"
+        pred_pcd.colors = o3d.utility.Vector3dVector(class2color[predction_101])
+        output_file = f"proposed_fusion_{self.out_file_prefix}_interval-{self.cfg.merge.interval}-visualize.ply"
         output_path = os.path.join(self.output_result_folder, output_file)
         o3d.io.write_point_cloud(output_path, pred_pcd)
         # save the graph with topk
         for idx, node in enumerate(scene_graph.nodes):
-            scene_graph.nodes[node]['top1_cls'] = CLASS_LABELS_200[pred_class[idx]]
+            scene_graph.nodes[node]['top1_cls'] = REPLICA_CLASSES[pred_class[idx]]
         output_file = f"proposed_fusion_{self.out_file_prefix}_interval-{self.cfg.merge.interval}-backprj-top1.pkl"
         scene_graph_path = os.path.join(self.output_predict_folder, output_file)
         with open(scene_graph_path, 'wb') as fp:
@@ -821,39 +807,38 @@ class ScanNetSceneGraph:
         # after obtaining the gt point class (N,) and predict point class (N,), use the evaluate
         # function in concept-graph or openscen to calculate the miou, fmiou and macc.
         # ----------------------------------------------------------------------------------------- #
-        # * hovsg evaluation * #
         # print number of unique labels in the ground truth and predicted pointclouds
-        print("Number of unique labels in the GT pcd: ", len(np.unique(self.semantic_gt_20)))
-        print("Number of unique labels in the pred pcd ", len(np.unique(predction_20)))
+        print("Number of unique labels in the GT pcd: ", len(np.unique(self.semantic_gt)))
+        print("Number of unique labels in the pred pcd ", len(np.unique(predction_101)))
         print(ignore)
 
         # knn interpolation & concat coords and labels for predicied pcd
         # prediction knn input
-        coords_labels = np.zeros((len(predction_20), 4))
+        coords_labels = np.zeros((len(predction_101), 4))
         coords_labels[:, :3] = self.gt_xyz.copy()
-        coords_labels[:, -1] = predction_20.copy()
-        coords_labels = coords_labels[coords_labels[:, -1] != -1]
+        coords_labels[:, -1] = predction_101.copy()
+        coords_labels = coords_labels[coords_labels[:, -1] != 0]
         # gt knn input
-        coords_gt = np.zeros((len(self.semantic_gt_20), 4))
+        coords_gt = np.zeros((len(self.semantic_gt), 4))
         coords_gt[:, :3] = self.gt_xyz.copy()
-        coords_gt[:, -1] = self.semantic_gt_20.copy()
-
+        coords_gt[:, -1] = self.semantic_gt.copy()
         match_pc = knn_interpolation(coords_labels, coords_gt, k=5)
-        predction_20 = match_pc[:, -1].reshape(-1, 1).astype(np.int32)
+        predction_101 = match_pc[:, -1].reshape(-1, 1).astype(np.int32)
 
         print("################ {} ################".format(self.scene_id))
-        predction_20 = predction_20.reshape(-1, 1)
-        semantic_gt_20 = self.semantic_gt_20.reshape(-1, 1)
-
-        ious = per_class_IU(predction_20, semantic_gt_20, ignore=ignore)
+        predction_101 = predction_101.reshape(-1, 1)
+        semantic_gt_101 = self.semantic_gt.reshape(-1, 1)
+        ious = per_class_IU(predction_101, semantic_gt_101, ignore=ignore)
         print("per class iou: ", ious)
-        miou = mean_IU(predction_20, semantic_gt_20, ignore=ignore, class_id_name=CLASS_LABELS_20)
+        miou = mean_IU(predction_101, semantic_gt_101, ignore=ignore, class_id_name=REPLICA_CLASSES)
+
+        print()
         print("miou: ", miou)
-        fmiou = frequency_weighted_IU(predction_20, semantic_gt_20, ignore=ignore)
+        fmiou = frequency_weighted_IU(predction_101, semantic_gt_101, ignore=ignore)
         print("fmiou: ", fmiou)
-        macc = mean_accuracy(predction_20, semantic_gt_20, ignore=ignore)
+        macc = mean_accuracy(predction_101, semantic_gt_101, ignore=ignore)
         print("macc: ", macc)
-        pacc = pixel_accuracy(predction_20, semantic_gt_20, ignore=ignore)
+        pacc = pixel_accuracy(predction_101, semantic_gt_101, ignore=ignore)
         print("pacc: ", pacc)
         print("#######################################")
 
@@ -866,18 +851,47 @@ class ScanNetSceneGraph:
             "pacc": pacc,
         }
 
-        output_file = f"proposed_fusion_{self.out_file_prefix}_interval-{self.cfg.merge.interval}-{self.cfg.eval.feature_name}-segment-{self.cfg.extractor.back_feat}.pkl"
+        # * concept-graph evaluation * #
+        conf_matrix = compute_confmatrix(torch.from_numpy(predction_101), torch.from_numpy(semantic_gt_101), REPLICA_CLASSES)
+        results2 = {
+            "conf_matrix": conf_matrix,
+            "keep_index": keep_index,
+        }
+
+        output_file = f"proposed_fusion_{self.out_file_prefix}_interval-{self.cfg.merge.interval}-{self.cfg.eval.feature_name}-segment-{self.cfg.extractor.back_feat}-db-concept-graph.pkl"
+        output_path = os.path.join(self.output_result_folder, output_file)
+        with open(output_path, 'wb') as fp:
+            pickle.dump(results2, fp)
+
+        output_file = f"proposed_fusion_{self.out_file_prefix}_interval-{self.cfg.merge.interval}-{self.cfg.eval.feature_name}-segment-{self.cfg.extractor.back_feat}-db.pkl"
         output_path = os.path.join(self.output_result_folder, output_file)
         with open(output_path, 'wb') as fp:
             pickle.dump(results, fp)
 
-        output_file = f"proposed_fusion_{self.out_file_prefix}_interval-{self.cfg.merge.interval}-{self.cfg.eval.feature_name}-segment-{self.cfg.extractor.back_feat}.txt"
+        output_file = f"proposed_fusion_{self.out_file_prefix}_interval-{self.cfg.merge.interval}-{self.cfg.eval.feature_name}-segment-{self.cfg.extractor.back_feat}-db.txt"
         output_path = os.path.join(self.output_result_folder, output_file)
         with open(output_path, 'w') as f:
             f.write(str(results))
         print(f"Processed {self.scene_id = }. Results saved to: {output_path}")
 
         return 0
+
+
+def compute_confmatrix(
+        labels_pred, labels_gt, class_names
+):
+    num_classes = len(class_names)
+    confmatrix = torch.zeros(num_classes, num_classes, device=labels_pred.device)
+
+    for class_gt_int in range(num_classes):
+        tensor_gt_class = torch.eq(labels_gt, class_gt_int).long()
+        for class_pred_int in range(num_classes):
+            tensor_pred_class = torch.eq(labels_pred, class_pred_int).long()
+            tensor_pred_class = torch.mul(tensor_gt_class, tensor_pred_class)
+            count = torch.sum(tensor_pred_class)
+            confmatrix[class_gt_int, class_pred_int] += count
+
+    return confmatrix
 
 
 def rep_dif_denoise(pred_features_list, neighbor_rate: float = 0.3):
@@ -892,9 +906,15 @@ def rep_dif_denoise(pred_features_list, neighbor_rate: float = 0.3):
     node_main_center = np.array(node_main_center)
 
     # 2. using the node_mean_center to calculate the adj matrix
-    node_adj_sim = -node_mean_center @ node_mean_center.T
+    node_adj_sim = - node_mean_center @ node_mean_center.T
     for i in range(num_node):
         node_adj_sim[i, i] = 0.0
+
+    # node_adj_dis = np.zeros([num_node, num_node])
+    # for i in range(num_node):
+    #     for j in range(i):
+    #         node_adj_dis[i, j] = np.linalg.norm(node_mean_center[i] - node_mean_center[j], ord=2)
+    # node_adj_dis = (node_adj_dis + node_adj_dis.T) / 1.0
 
     # 3. find the nergibors of each node
     neighbor_num = int(neighbor_rate * num_node)
@@ -939,7 +959,7 @@ def find_top_k_neighbors(distance_matrix, k=3):
     return neighbors
 
 
-def feats_denoise_dbscan(feats, eps=0.01, min_points=50):
+def feats_denoise_dbscan(feats, eps=0.01, min_points=80):
     """
         Denoise the features using DBSCAN
         :param feats: Features to denoise.
@@ -962,14 +982,11 @@ def feats_denoise_dbscan(feats, eps=0.01, min_points=50):
     if counter and (-1 in counter):
         del counter[-1]
 
-    # print(counter)
     if counter:
         # Find the label of the largest cluster
         most_common_label, _ = counter.most_common(1)[0]
         # Create mask for points in the largest cluster
         largest_mask = labels == most_common_label
-        print(np.sum(largest_mask), labels.shape[0])
-
         # Apply mask
         largest_cluster_feats = feats[largest_mask]
         lfeats = largest_cluster_feats
@@ -984,3 +1001,64 @@ def feats_denoise_dbscan(feats, eps=0.01, min_points=50):
     else:
         lfeats = np.mean(feats, axis=0)
     return lfeats
+
+
+def knn_interpolation(cumulated_pc: np.ndarray, full_sized_data: np.ndarray, k):
+    """
+    Using k-nn interpolation to find labels of points of the full sized pointcloud
+    :param cumulated_pc: cumulated pointcloud results after running the network
+    :param full_sized_data: full sized point cloud
+    :param k: k for k nearest neighbor interpolation
+    :return: pointcloud with predicted labels in last column and ground truth labels in last but one column
+    """
+
+    labeled = cumulated_pc[cumulated_pc[:, -1] != -1]
+    to_be_predicted = full_sized_data.copy()
+
+    ball_tree = BallTree(labeled[:, :3], metric="minkowski")
+    knn_classes = labeled[ball_tree.query(to_be_predicted[:, :3], k=k)[1]][:, :, -1].astype(int)
+    print("knn_classes: ", knn_classes.shape)
+
+    interpolated = np.zeros(knn_classes.shape[0])
+    for i in range(knn_classes.shape[0]):
+        interpolated[i] = np.bincount(knn_classes[i]).argmax()
+
+    output = np.zeros((to_be_predicted.shape[0], to_be_predicted.shape[1] + 1))
+    output[:, :-1] = to_be_predicted
+    output[:, -1] = interpolated
+
+    assert output.shape[0] == full_sized_data.shape[0]
+    return output
+
+
+def get_predicted_instances(scene_graph, feature_name="feature"):
+    node_visual_features = []
+    node_caption_features = []
+    node_masks = []
+    n_pts = scene_graph.graph['n_pts']
+
+    node_visual_features_list = []
+    node_caption_features_list = []
+
+    for node in scene_graph.nodes:
+        if feature_name == "feature":
+            node_visual_features.append(scene_graph.nodes[node]['feature'])
+            node_caption_features.append(scene_graph.nodes[node]['feature'])
+            node_visual_features_list.append(None)
+            node_caption_features_list.append(None)
+
+        else:
+            node_visual_features.append(scene_graph.nodes[node]['back_prj_feat_mean'])
+            node_caption_features.append(scene_graph.nodes[node]['back_prj_cap_feat_mean'] if "back_prj_cap_feat_mean" in scene_graph.nodes[node] else scene_graph.nodes[node]['back_prj_feat_mean'])  # back_prj_cap_feat_mean
+            node_visual_features_list.append(scene_graph.nodes[node]['back_prj_feat_list'])
+            node_caption_features_list.append(scene_graph.nodes[node]['back_prj_cap_feat_list'])
+
+        node_mask = np.zeros(n_pts, dtype=np.bool_)
+        node_mask[scene_graph.nodes[node]["pt_indices"]] = True
+        node_masks.append(node_mask)
+
+    node_visual_features = np.vstack(node_visual_features)  # (N, n_dims)
+    node_caption_features = np.vstack(node_caption_features)  # (N, n_dims)
+    node_masks = np.stack(node_masks)  # (N, n_pts)
+
+    return node_visual_features, node_masks, node_caption_features, node_visual_features_list, node_caption_features_list

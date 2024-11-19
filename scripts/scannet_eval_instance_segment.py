@@ -19,7 +19,7 @@ import torch
 
 from openmask3d_tools.eval_semantic_instance import evaluate
 from datasets.constants.scannet.scannet200_constants import SCANNET_COLOR_MAP_20, VALID_CLASS_IDS_20, CLASS_LABELS_20, SCANNET_COLOR_MAP_200, VALID_CLASS_IDS_200, CLASS_LABELS_200
-from tiger.utils.scene_path import parse_scene_path
+from ovgrpah.utils.scene_path import parse_scene_path
 
 
 class InstSegEvaluator:
@@ -182,8 +182,8 @@ def test_pipeline_full_scannet200_mgl(cfg):
     # gt_paths = ["scene0011_00", "scene0050_00", "scene0231_00", "scene0378_00", "scene0518_00"]
 
     # voc feature
-    l_vocab_features = np.load(f"./tiger/evaluation/voc_features/scannet200_clip_l_14_vild.npy")
-    h_vocab_features = np.load(f"./tiger/evaluation/voc_features/scannet200_clip_h_14.npy")
+    l_vocab_features = np.load(f"./ovgraph/evaluation/voc_features/scannet200_clip_l_14_vild.npy")
+    h_vocab_features = np.load(f"./ovgraph/evaluation/voc_features/scannet200_clip_h_14.npy")
     # 200 -> 600 id mapper
     label_mapper = np.vectorize({idx: el for idx, el in enumerate(VALID_CLASS_IDS_200)}.get)
 

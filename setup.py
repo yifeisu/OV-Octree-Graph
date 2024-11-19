@@ -1,8 +1,8 @@
 from setuptools import setup, find_packages
 
 setup(
-    name='tiger',
+    name='ovgrpah',
     version='1.0.0',
-    description='Tiger-O3D',
+    description='OV-Octree-Graph',
     packages=find_packages(),
 )
