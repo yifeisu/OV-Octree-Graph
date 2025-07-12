@@ -1,6 +1,8 @@
-# Open-Vocabulary Octree-Graph for 3D Scene Understanding
+<h2 align="center">Open-Vocabulary Octree-Graph for 3D Scene Understanding</h2>
 
-<center> Anonymous GitHub Repository of Paper 11271 </center>
+<p align="center">Zhigang Wang1*, Yifei Su∗, Chenhui Li∗, Dong Wang, Yan Huang, Bin Zhao, Xuelong Li</p>
+
+<h5 align="center">Accepted to ICCV2025</h5>
 
 
 
