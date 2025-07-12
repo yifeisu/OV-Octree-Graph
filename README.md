@@ -1,16 +1,14 @@
 <h2 align="center">Open-Vocabulary Octree-Graph for 3D Scene Understanding</h2>
 
-<p align="center">Zhigang Wang1*, Yifei Su∗, Chenhui Li∗, Dong Wang, Yan Huang, Bin Zhao, Xuelong Li</p>
+<p align="center">Zhigang Wang1*, Yifei Su*, Chenhui Li*, Dong Wang, Yan Huang, Bin Zhao, Xuelong Li</p>
 
 <h5 align="center">Accepted to ICCV2025</h5>
-
-
 
 <div align=center>
     <img src="asserts/overview.png" alt="Overview of our method." />
 </div>
 
-Given an RGB-D scan sequence and a reconstructed point cloud, we employs a  chronological group-wise merging method to integrate 2D masks into complete 3D instances, achieving strong performance in 3D zero-shot semantic segmentation and instance segmentation. Additionally, we proposes an efficient adaptive octree-graph for representing instance occupation details, supporting various downstream tasks, e.g, instance retrieval and path planning.
+Given an RGB-D scan sequence and a reconstructed point cloud, we employ a  chronological group-wise merging method to integrate 2D masks into complete 3D instances, achieving strong performance in 3D zero-shot semantic segmentation and instance segmentation. Additionally, we propose an efficient adaptive octree-graph for representing instance occupation details, supporting various downstream tasks, e.g, instance retrieval and path planning.
 
 
 
@@ -22,7 +20,7 @@ Given an RGB-D scan sequence and a reconstructed point cloud, we employs a  chro
 conda create -n ovgrpah python=3.10
 conda activate ovgrpah
 
-# pytorch installation
+# PyTorch installation
 pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
 
 # pytorch3d installation
