@@ -17,7 +17,7 @@ Given an RGB-D scan sequence and a reconstructed point cloud, we employ a  chron
 #### 1.1 Basic Dependencies
 
 ```bash
-conda create -n ovgrpah python=3.10
+conda create -n ovgraph python=3.10
 conda activate ovgraph
 
 # PyTorch installation
