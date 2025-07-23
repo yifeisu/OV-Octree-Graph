@@ -21,7 +21,7 @@ extractor:
   type: ovseg_tap
   config_file: ./3rdparty/ovseg/configs/ovseg_swinB_vitL_demo.yaml
   feat_dim: 1024
-  voc_feature: ./ovgrpah/evaluation/voc_features/replica101_clip_l_14_vild.npy
+  voc_feature: ./ovgraph/evaluation/voc_features/replica101_clip_l_14_vild.npy
   back_feat: clip
 
 merge:

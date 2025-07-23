@@ -17,7 +17,7 @@ import open3d.visualization.rendering as rendering
 import numpy as np
 import networkx as nx
 
-from ovgrpah.utils.utils import vis_pcd
+from ovgraph.utils.utils import vis_pcd
 from datasets.constants.replica.replica_constants import REPLICA_CLASSES, REPLICA_CLASSES_VALIDATION, REPLICA_COLOR_MAP_101
 from datasets.constants.scannet.scannet200_constants import VALID_CLASS_IDS_20, CLASS_LABELS_20, SCANNET_COLOR_MAP_20, VALID_CLASS_IDS_200, CLASS_LABELS_200, SCANNET_COLOR_MAP_200
 

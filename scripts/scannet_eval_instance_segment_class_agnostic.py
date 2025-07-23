@@ -14,7 +14,7 @@ from omegaconf import OmegaConf
 
 from openmask3d_tools.eval_semantic_instance import evaluate
 from datasets.constants.scannet.scannet200_constants import SCANNET_COLOR_MAP_20, VALID_CLASS_IDS_20, CLASS_LABELS_20, SCANNET_COLOR_MAP_200, VALID_CLASS_IDS_200, CLASS_LABELS_200
-from ovgrpah.utils.scene_path import parse_scene_path
+from ovgraph.utils.scene_path import parse_scene_path
 
 
 class InstSegEvaluator:

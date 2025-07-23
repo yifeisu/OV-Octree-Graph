@@ -9,7 +9,7 @@ from time import perf_counter
 from omegaconf import OmegaConf
 
 import torch
-from ovgrpah.scene import ReplicaSceneGraph
+from ovgraph.scene import ReplicaSceneGraph
 
 
 def mgl_graph(dataset, video, idx, cfg, available_devices):

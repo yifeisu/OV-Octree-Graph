@@ -11,7 +11,7 @@ from omegaconf import OmegaConf
 
 import torch
 
-from ovgrpah.scene import ScanNetSceneGraph
+from ovgraph.scene import ScanNetSceneGraph
 
 
 def mgl_graph(dataset, video, idx, cfg, available_devices):
