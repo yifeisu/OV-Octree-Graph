@@ -18,7 +18,7 @@ Given an RGB-D scan sequence and a reconstructed point cloud, we employ a  chron
 
 ```bash
 conda create -n ovgrpah python=3.10
-conda activate ovgrpah
+conda activate ovgraph
 
 # PyTorch installation
 pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
@@ -137,7 +137,7 @@ Run `pip install -e .` for installing the code.
 
 ### 2. Pretrained Checkpoints
 
-Create the pretrained_weights directory and and download the following weights: 
+Create the pretrained_weights directory and download the following weights: 
 
 ```bash
 mkdir pretrained_weights && cd pretrained_weights 
